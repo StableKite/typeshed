@@ -1,0 +1,126 @@
+name: StableKite strict Pyright
+
+
+on:
+  push:
+    branches:
+      - stablekite/typing-pyright-ci-v2
+  workflow_dispatch:
+
+
+jobs:
+  strict-pyright:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+
+      - name: Install real runtime and latest Pyright
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pywin32==312" "types-pywin32==312.0.0.20260928"
+          python -m pip show -f types-pywin32
+          npm install --global pyright
+          pyright --version
+          python -c "import sys, pywintypes, win32api, win32con, win32event, win32file, win32pipe; print(sys.version); print(win32api.GetVersionEx()); print('runtime-imports=PASS')"
+
+
+      - name: Overlay candidate canonical stubs
+        shell: pwsh
+        run: |
+          $site = (python -c "import site; print(site.getsitepackages()[0])").Trim()
+          $fileStub = Get-ChildItem $site -Recurse -File -Filter "win32file.pyi" | Select-Object -First 1
+          $pipeStub = Get-ChildItem $site -Recurse -File -Filter "win32pipe.pyi" | Select-Object -First 1
+          if (-not $fileStub) { throw "types-pywin32 win32file.pyi not found below $site" }
+          if (-not $pipeStub) { throw "types-pywin32 win32pipe.pyi not found below $site" }
+          Write-Host "WIN32FILE_STUB=$($fileStub.FullName)"
+          Write-Host "WIN32PIPE_STUB=$($pipeStub.FullName)"
+          Copy-Item "stubs/pywin32/win32/win32file.pyi" $fileStub.FullName -Force
+          Copy-Item "stubs/pywin32/win32/win32pipe.pyi" $pipeStub.FullName -Force
+          if ((Get-FileHash "stubs/pywin32/win32/win32file.pyi").Hash -ne (Get-FileHash $fileStub.FullName).Hash) { throw "win32file overlay mismatch" }
+          if ((Get-FileHash "stubs/pywin32/win32/win32pipe.pyi").Hash -ne (Get-FileHash $pipeStub.FullName).Hash) { throw "win32pipe overlay mismatch" }
+          Write-Host "candidate-overlay=PASS"
+
+
+      - name: Strict StableKite pywin32 surface
+        shell: pwsh
+        run: |
+          @'
+          from typing import assert_type
+
+
+          import pywintypes
+          import win32api
+          import win32con
+          import win32event
+          import win32file
+          import win32pipe
+
+
+          version = win32api.GetVersionEx()
+          assert_type(version, tuple[int, int, int, int, str])
+
+
+          generic_read: int = win32con.GENERIC_READ
+          event_handle = win32event.CreateEvent(None, False, False, None)
+          assert_type(event_handle, int)
+
+
+          overlapped = pywintypes.OVERLAPPED()
+          security = pywintypes.SECURITY_ATTRIBUTES()
+
+
+          wait_result = win32pipe.WaitNamedPipe(r"\\.\pipe\stablekite-typecheck", 100)
+          assert_type(wait_result, None)
+
+
+          connect_result = win32pipe.ConnectNamedPipe(0, overlapped)
+          assert_type(connect_result, int)
+
+
+          peek_result = win32pipe.PeekNamedPipe(0, 0)
+          assert_type(peek_result, tuple[bytes, int, int])
+
+
+          pipe_handle = win32pipe.CreateNamedPipe(
+              r"\\.\pipe\stablekite-typecheck",
+              0,
+              0,
+              1,
+              4096,
+              4096,
+              1000,
+              security,
+          )
+          assert_type(pipe_handle, int)
+
+
+          sync_io = win32file.DeviceIoControl(0, 0, None, 16)
+          assert_type(sync_io, bytes)
+
+
+          async_io = win32file.DeviceIoControl(0, 0, None, 16, overlapped)
+          assert_type(async_io, memoryview)
+
+
+          writable = bytearray(16)
+          writable_result = win32file.DeviceIoControl(0, 0, None, writable)
+          '@ | Set-Content strict_consumer.py -Encoding utf8NoBOM
+
+
+          @'
+          {
+            "typeCheckingMode": "strict",
+            "pythonVersion": "3.14",
+            "include": ["strict_consumer.py"],
+            "reportPrivateImportUsage": "error"
+          }
+          '@ | Set-Content pyrightconfig.stablekite.json -Encoding utf8NoBOM
+
+
+          pyright --version
+          pyright --project pyrightconfig.stablekite.json --pythonpath (Get-Command python).Source
